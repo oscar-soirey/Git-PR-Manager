@@ -10,6 +10,7 @@ Examples:
     python pr_manager.py --method squash --delete-branch
     python pr_manager.py --dry-run             # review everything, merge nothing
     python pr_manager.py --auto                # merge every open PR, no questions asked
+    python pr_manager.py --auto --force incoming   # ... and take the PR side on every conflict
 """
 
 from __future__ import annotations
@@ -370,7 +371,8 @@ def show_decisions(decisions: dict[str, str], base: str, number: int) -> None:
 
 
 def _resolve_in_worktree(wt: str, repo: str, pr: dict[str, Any],
-                         head_sha: str, dry_run: bool) -> bool:
+                         head_sha: str, dry_run: bool,
+                         force: Optional[str] = None) -> bool:
     base, number = pr["baseRefName"], pr["number"]
 
     merge = _run(["git", "merge", "--no-commit", "--no-ff", head_sha], cwd=wt, check=False)
@@ -381,7 +383,9 @@ def _resolve_in_worktree(wt: str, repo: str, pr: dict[str, Any],
     decisions: dict[str, str] = {}
     if files:
         console.print(f"\n[bold yellow]{len(files)} conflicted file(s).[/]\n")
-        chosen = choose_per_file(wt, files, base, number)
+        # --force: same side for every file, no prompt.
+        chosen = ({path: force for path in files} if force
+                  else choose_per_file(wt, files, base, number))
         if chosen is None:
             git("merge", "--abort", cwd=wt)
             return False
@@ -395,7 +399,7 @@ def _resolve_in_worktree(wt: str, repo: str, pr: dict[str, Any],
     else:
         console.print("[green]No conflicts anymore: git merged everything automatically.[/]")
 
-    if not dry_run and not ask_yes_no(
+    if not dry_run and not force and not ask_yes_no(
             f"\nPush the merge commit directly to {base}? "
             "This bypasses PR review rules.", default=False):
         git("merge", "--abort", cwd=wt)
@@ -414,8 +418,12 @@ def _resolve_in_worktree(wt: str, repo: str, pr: dict[str, Any],
     return True
 
 
-def resolve_and_push(repo: str, pr: dict[str, Any], dry_run: bool) -> bool:
+def resolve_and_push(repo: str, pr: dict[str, Any], dry_run: bool,
+                     force: Optional[str] = None) -> bool:
     """Merge a conflicting PR with a current/incoming choice per file.
+
+    With `force` ("current" or "incoming"), that side wins for every conflicted
+    file and nothing is asked (used by --auto --force).
 
     Returns True when merged (or when a dry run would have merged), False if aborted.
     """
@@ -435,7 +443,7 @@ def resolve_and_push(repo: str, pr: dict[str, Any], dry_run: bool) -> bool:
         wt = str(Path(tmp) / "worktree")
         git("worktree", "add", "--detach", wt, base_sha)
         try:
-            return _resolve_in_worktree(wt, repo, pr, head_sha, dry_run)
+            return _resolve_in_worktree(wt, repo, pr, head_sha, dry_run, force)
         finally:
             try:
                 git("worktree", "remove", "--force", wt)
@@ -804,11 +812,36 @@ def run_session(repo: str, prs: list[dict[str, Any]], args: argparse.Namespace) 
 def run_auto(repo: str, prs: list[dict[str, Any]], args: argparse.Namespace) -> Stats:
     """Non-interactive mode: merge every PR, oldest first, without asking anything.
 
-    PRs with conflicts are skipped (resolving them needs a human choice).
+    PRs with conflicts are skipped (resolving them needs a human choice), unless
+    --force current|incoming is given: that side then wins for every conflicted
+    file of every PR, and the merge is pushed directly to the base branch.
     Branch protection rules on GitHub still apply: a PR that GitHub refuses
     to merge is reported as failed and the run continues.
     """
     stats = Stats(total=len(prs))
+    force = args.force
+
+    def force_resolve(head: str, pr: dict[str, Any]) -> None:
+        """Resolve a conflicting PR with the forced side; update stats and output."""
+        try:
+            done = resolve_and_push(args.repo_name, pr, args.dry_run, force)
+        except GhError as exc:
+            stats.failed += 1
+            log_event(args.repo_name, pr, "failed", f"force {force}: {exc}")
+            console.print(f"{head}\n  [red]✗ {escape(str(exc))}[/]")
+            return
+        if not done:
+            stats.skipped += 1
+            console.print(f"{head}\n  [yellow]– not merged[/]")
+            return
+        stats.merged += 1
+        if args.dry_run:
+            log_event(args.repo_name, pr, "dry-run-merge", f"force {force}")
+            console.print(f"{head}\n  [yellow]✓ dry run: would be merged "
+                          f"(conflicts: {force})[/]")
+        else:
+            log_event(args.repo_name, pr, "merged", f"conflicts resolved: {force} (auto)")
+            console.print(f"{head}\n  [green]✓ merged (conflicts: {force})[/]")
 
     for index, listed in enumerate(prs, 1):
         number = listed["number"]
@@ -830,6 +863,10 @@ def run_auto(repo: str, prs: list[dict[str, Any]], args: argparse.Namespace) -> 
         for warning in risk_warnings(pr):
             console.print(f"  [yellow]⚠ {warning}[/]")
 
+        if pr.get("mergeable") == "CONFLICTING" and force:
+            force_resolve(head, pr)
+            continue
+
         if pr.get("mergeable") == "CONFLICTING":
             stats.skipped += 1
             log_event(args.repo_name, pr, "auto-skipped-conflict")
@@ -846,7 +883,9 @@ def run_auto(repo: str, prs: list[dict[str, Any]], args: argparse.Namespace) -> 
         try:
             merge_pr(args.repo_name, pr, args.method, args.delete_branch)
         except GhError as exc:
-            if is_conflict_error(exc):
+            if is_conflict_error(exc) and force:
+                force_resolve(head, pr)
+            elif is_conflict_error(exc):
                 stats.skipped += 1
                 log_event(args.repo_name, pr, "auto-skipped-conflict", str(exc))
                 console.print(f"{head}\n  [yellow]– has conflicts, skipped[/]")
@@ -880,8 +919,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--auto", action="store_true",
                         help="merge every open PR automatically, without any prompt "
                              "(PRs with conflicts are skipped)")
+    parser.add_argument("--force", choices=["current", "incoming"],
+                        help="with --auto: resolve every conflict of every PR by keeping "
+                             "'current' (base branch) or taking 'incoming' (the PR); "
+                             "pushed directly to the base branch")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.force and not args.auto:
+        parser.error("--force can only be used together with --auto")
+    return args
 
 
 def main(argv: Optional[list[str]] = None) -> int:
