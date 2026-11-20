@@ -82,6 +82,9 @@ python pr_manager.py --base main --author octocat --include-drafts
 
 # Merge every open PR automatically
 python pr_manager.py -R owner/name --auto
+
+# Same, and resolve every conflict by taking the PR's version
+python pr_manager.py -R owner/name --auto --force incoming
 ```
 
 ### Parameters
@@ -96,6 +99,7 @@ python pr_manager.py -R owner/name --auto
 | `--delete-branch` | Delete the head branch after merging |
 | `--dry-run` | Review only, never merge |
 | `--auto` | Merge every open PR automatically, without any prompt |
+| `--force {current,incoming}` | With `--auto`: resolve every conflict, in every PR and file, with that side |
 | `--version` | Show the version |
 
 ## How it works
@@ -112,6 +116,10 @@ When a PR has conflicts, the tool offers to resolve them file by file. The merge
 ### Auto mode
 
 `--auto` merges every open PR, oldest first, without asking anything. PRs with conflicts are **skipped** (resolving them needs a human choice), and any PR that GitHub refuses to merge, for example because of branch protection, is reported as failed while the run continues.
+
+#### `--auto --force current|incoming`
+
+Add `--force` to resolve conflicts too, without any prompt: `current` keeps the version already on the base branch, `incoming` takes the version from the PR. The same side is applied to **all conflicted files of all PRs**. Each conflicting PR is merged in a temporary worktree and pushed **directly** to the base branch (never forced), so it bypasses PR review rules and needs a local clone of the repository. `--force` is refused without `--auto`.
 
 ### Audit log
 
